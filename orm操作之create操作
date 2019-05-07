@@ -1,0 +1,160 @@
+orm create操作最终执行的操作
+django/db/models/sql/compiler.py
+
+class SQLInsertCompiler(SQLCompiler):
+    return_id = False
+
+    def as_sql(self):
+        # We don't need quote_name_unless_alias() here, since these are all
+        # going to be column names (so we can avoid the extra overhead).
+        qn = self.connection.ops.quote_name
+        opts = self.query.get_meta()
+        result = ['INSERT INTO %s' % qn(opts.db_table)]
+        fields = self.query.fields or [opts.pk]
+        result.append('(%s)' % ', '.join(qn(f.column) for f in fields))
+
+        if self.query.fields:
+            value_rows = [
+                [self.prepare_value(field, self.pre_save_val(field, obj)) for field in fields]
+                for obj in self.query.objs
+            ]
+        else:
+            # An empty object.
+            value_rows = [[self.connection.ops.pk_default_value()] for _ in self.query.objs]
+            fields = [None]
+
+        # Currently the backends just accept values when generating bulk
+        # queries and generate their own placeholders. Doing that isn't
+        # necessary and it should be possible to use placeholders and
+        # expressions in bulk inserts too.
+        can_bulk = (not self.return_id and self.connection.features.has_bulk_insert)
+
+        placeholder_rows, param_rows = self.assemble_as_sql(fields, value_rows)
+
+        if self.return_id and self.connection.features.can_return_id_from_insert:
+            if self.connection.features.can_return_ids_from_bulk_insert:
+                result.append(self.connection.ops.bulk_insert_sql(fields, placeholder_rows))
+                params = param_rows
+            else:
+                result.append("VALUES (%s)" % ", ".join(placeholder_rows[0]))
+                params = [param_rows[0]]
+            col = "%s.%s" % (qn(opts.db_table), qn(opts.pk.column))
+            r_fmt, r_params = self.connection.ops.return_insert_id()
+            # Skip empty r_fmt to allow subclasses to customize behavior for
+            # 3rd party backends. Refs #19096.
+            if r_fmt:
+                result.append(r_fmt % col)
+                params += [r_params]
+            return [(" ".join(result), tuple(chain.from_iterable(params)))]
+
+        if can_bulk:
+            result.append(self.connection.ops.bulk_insert_sql(fields, placeholder_rows))
+            return [(" ".join(result), tuple(p for ps in param_rows for p in ps))]
+        else:
+            return [
+                (" ".join(result + ["VALUES (%s)" % ", ".join(p)]), vals)
+                for p, vals in zip(placeholder_rows, param_rows)
+            ]
+
+    def execute_sql(self, return_id=False):
+        assert not (
+            return_id and len(self.query.objs) != 1 and
+            not self.connection.features.can_return_ids_from_bulk_insert
+        )
+        self.return_id = return_id
+        with self.connection.cursor() as cursor:
+            for sql, params in self.as_sql():
+                cursor.execute(sql, params)
+            if not return_id:
+                return
+            if self.connection.features.can_return_ids_from_bulk_insert and len(self.query.objs) > 1:
+                return self.connection.ops.fetch_returned_insert_ids(cursor)
+            if self.connection.features.can_return_id_from_insert:
+                assert len(self.query.objs) == 1
+                return self.connection.ops.fetch_returned_insert_id(cursor)
+            return self.connection.ops.last_insert_id(
+                cursor, self.query.get_meta().db_table, self.query.get_meta().pk.column
+            )
+核心的方法就是execute_sql方法,self.as_sql 对执行的操作进行sql语句的组装.同时create操作也支持批量操作
+
+继续往下走,就到了具体的数据库后端.
+cursor.execute(sql, parmas)
+django项目的后端一般使用mysql后端.所以cursor.execute就会执行跳转到mysql的执行.
+MySQLdb\cursors.py
+class BaseCursor(object):
+    """A base for Cursor classes. Useful attributes:
+
+    description
+        A tuple of DB API 7-tuples describing the columns in
+        the last executed query; see PEP-249 for details.
+
+    description_flags
+        Tuple of column flags for last query, one entry per column
+        in the result set. Values correspond to those in
+        MySQLdb.constants.FLAG. See MySQL documentation (C API)
+        for more information. Non-standard extension.
+
+    arraysize
+        default number of rows fetchmany() will fetch
+    """
+        def execute(self, query, args=None):
+        """Execute a query.
+
+        query -- string, query to execute on server
+        args -- optional sequence or mapping, parameters to use with query.
+
+        Note: If args is a sequence, then %s must be used as the
+        parameter placeholder in the query. If a mapping is used,
+        %(key)s must be used as the placeholder.
+
+        Returns integer represents rows affected, if any
+        """
+        while self.nextset():
+            pass
+        db = self._get_db()
+
+        # NOTE:
+        # Python 2: query should be bytes when executing %.
+        # All unicode in args should be encoded to bytes on Python 2.
+        # Python 3: query should be str (unicode) when executing %.
+        # All bytes in args should be decoded with ascii and surrogateescape on Python 3.
+        # db.literal(obj) always returns str.
+
+        if PY2 and isinstance(query, unicode):
+            query = query.encode(db.encoding)
+
+        if args is not None:
+            if isinstance(args, dict):
+                args = dict((key, db.literal(item)) for key, item in args.items())
+            else:
+                args = tuple(map(db.literal, args))
+            if not PY2 and isinstance(query, (bytes, bytearray)):
+                query = query.decode(db.encoding)
+            try:
+                query = query % args
+            except TypeError as m:
+                self.errorhandler(self, ProgrammingError, str(m))
+
+        if isinstance(query, unicode):
+            query = query.encode(db.encoding, 'surrogateescape')
+
+        res = None
+        try:
+            res = self._query(query)
+        except Exception:
+            exc, value = sys.exc_info()[:2]
+            self.errorhandler(self, exc, value)
+        if not self._defer_warnings:
+            self._warning_check()
+        return res
+ 
+ 执行的核心方法是如下一段:
+ try:
+    res = self._query(query)
+except Exception:
+    exc, value = sys.exc_info()[:2]
+    self.errorhandler(self, exc, value)
+越往后走,就越能发现里面的秘密,目前在这里打住,后续在分析
+
+
+     
