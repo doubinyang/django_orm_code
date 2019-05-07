@@ -157,4 +157,7 @@ except Exception:
 越往后走,就越能发现里面的秘密,目前在这里打住,后续在分析
 
 
+总结:
+对create的操作的分析,已经发现了orm的大宝库.sql的相关操作其实都集中在django\db\models\sql\compiler.py里面.
+SQLCompiler,SQLInsertCompiler,SQLDeleteCompiler,SQLUpdateCompiler,SQLAggregateCompiler就对应增删改查操作
      
