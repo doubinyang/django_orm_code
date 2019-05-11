@@ -1,0 +1,603 @@
+UpdateModelMixin
+class UpdateModelMixin(object):
+    """
+    Update a model instance.
+    """
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+
+        if getattr(instance, '_prefetched_objects_cache', None):
+            # If 'prefetch_related' has been applied to a queryset, we need to
+            # forcibly invalidate the prefetch cache on the instance.
+            instance._prefetched_objects_cache = {}
+
+        return Response(serializer.data)
+
+    def perform_update(self, serializer):
+        serializer.save()
+ 
+ rest_framework\serializers.py
+ class BaseSerializer(Field):
+     def save(self, **kwargs):
+        assert not hasattr(self, 'save_object'), (
+            'Serializer `%s.%s` has old-style version 2 `.save_object()` '
+            'that is no longer compatible with REST framework 3. '
+            'Use the new-style `.create()` and `.update()` methods instead.' %
+            (self.__class__.__module__, self.__class__.__name__)
+        )
+
+        assert hasattr(self, '_errors'), (
+            'You must call `.is_valid()` before calling `.save()`.'
+        )
+
+        assert not self.errors, (
+            'You cannot call `.save()` on a serializer with invalid data.'
+        )
+
+        # Guard against incorrect use of `serializer.save(commit=False)`
+        assert 'commit' not in kwargs, (
+            "'commit' is not a valid keyword argument to the 'save()' method. "
+            "If you need to access data before committing to the database then "
+            "inspect 'serializer.validated_data' instead. "
+            "You can also pass additional keyword arguments to 'save()' if you "
+            "need to set extra attributes on the saved model instance. "
+            "For example: 'serializer.save(owner=request.user)'.'"
+        )
+
+        assert not hasattr(self, '_data'), (
+            "You cannot call `.save()` after accessing `serializer.data`."
+            "If you need to access data before committing to the database then "
+            "inspect 'serializer.validated_data' instead. "
+        )
+
+        validated_data = dict(
+            list(self.validated_data.items()) +
+            list(kwargs.items())
+        )
+
+        if self.instance is not None:
+            self.instance = self.update(self.instance, validated_data)
+            assert self.instance is not None, (
+                '`update()` did not return an object instance.'
+            )
+        else:
+            self.instance = self.create(validated_data)
+            assert self.instance is not None, (
+                '`create()` did not return an object instance.'
+            )
+
+self.instance = self.update(self.instance, validated_data)
+
+rest_framework\serializers.py
+class ModelSerializer(Serializer):
+      def update(self, instance, validated_data):
+        raise_errors_on_nested_writes('update', self, validated_data)
+        info = model_meta.get_field_info(instance)
+
+        # Simply set each attribute on the instance, and then save it.
+        # Note that unlike `.create()` we don't need to treat many-to-many
+        # relationships as being a special case. During updates we already
+        # have an instance pk for the relationships to be associated with.
+        for attr, value in validated_data.items():
+            if attr in info.relations and info.relations[attr].to_many:
+                field = getattr(instance, attr)
+                field.set(value)
+            else:
+                setattr(instance, attr, value)
+        instance.save()
+
+        return instance
+
+instance.save()
+drest\models.py
+class Snippet(models.Model):
+    created = models.DateTimeField(auto_now_add=True)
+    title = models.CharField(max_length=100, blank=True, default='')
+    code = models.TextField()
+    linenos = models.BooleanField(default=False)
+    language = models.CharField(choices=LANGUAGE_CHOICES, default='python', max_length=100)
+    style = models.CharField(choices=STYLE_CHOICES, default='friendly', max_length=100)
+    owner = models.ForeignKey('auth.User', related_name='snippets', on_delete=models.CASCADE)
+    highlighted = models.TextField()
+
+    class Meta:
+        ordering = ('created',)
+
+    def save(self, *args, **kwargs):
+        """
+        Use the `pygments` library to create a highlighted HTML
+        representation of the code snippet.
+        """
+        lexer = get_lexer_by_name(self.language)
+        linenos = 'table' if self.linenos else False
+        options = {'title': self.title} if self.title else {}
+        formatter = HtmlFormatter(style=self.style, linenos=linenos,
+                                  full=True, **options)
+        self.highlighted = highlight(self.code, lexer, formatter)
+        super(Snippet, self).save(*args, **kwargs)
+
+super(Snippet, self).save(*args, **kwargs)
+class Model(metaclass=ModelBase):
+    def save(self, force_insert=False, force_update=False, using=None,
+             update_fields=None):
+        for field in self._meta.concrete_fields:
+           
+            if field.is_relation and field.is_cached(self):
+                obj = getattr(self, field.name, None)
+                
+                if obj and obj.pk is None:
+                    # Remove the object from a related instance cache.
+                    if not field.remote_field.multiple:
+                        field.remote_field.delete_cached_value(obj)
+                    raise ValueError(
+                        "save() prohibited to prevent data loss due to "
+                        "unsaved related object '%s'." % field.name
+                    )
+                # If the relationship's pk/to_field was changed, clear the
+                # cached relationship.
+                if obj and getattr(obj, field.target_field.attname) != getattr(self, field.attname):
+                    field.delete_cached_value(self)
+
+        using = using or router.db_for_write(self.__class__, instance=self)
+        if force_insert and (force_update or update_fields):
+            raise ValueError("Cannot force both insert and updating in model saving.")
+
+        deferred_fields = self.get_deferred_fields()
+        if update_fields is not None:
+            # If update_fields is empty, skip the save. We do also check for
+            # no-op saves later on for inheritance cases. This bailout is
+            # still needed for skipping signal sending.
+            if not update_fields:
+                return
+
+            update_fields = frozenset(update_fields)
+            field_names = set()
+
+            for field in self._meta.fields:
+                if not field.primary_key:
+                    field_names.add(field.name)
+
+                    if field.name != field.attname:
+                        field_names.add(field.attname)
+
+            non_model_fields = update_fields.difference(field_names)
+
+            if non_model_fields:
+                raise ValueError("The following fields do not exist in this "
+                                 "model or are m2m fields: %s"
+                                 % ', '.join(non_model_fields))
+
+        elif not force_insert and deferred_fields and using == self._state.db:
+            field_names = set()
+            for field in self._meta.concrete_fields:
+                if not field.primary_key and not hasattr(field, 'through'):
+                    field_names.add(field.attname)
+            loaded_fields = field_names.difference(deferred_fields)
+            if loaded_fields:
+                update_fields = frozenset(loaded_fields)
+
+        self.save_base(using=using, force_insert=force_insert,
+                       force_update=force_update, update_fields=update_fields)
+
+
+    def save_base(self, raw=False, force_insert=False,
+                  force_update=False, using=None, update_fields=None):
+        using = using or router.db_for_write(self.__class__, instance=self)
+        assert not (force_insert and (force_update or update_fields))
+        assert update_fields is None or update_fields
+        cls = origin = self.__class__
+        # Skip proxies, but keep the origin as the proxy model.
+        if cls._meta.proxy:
+            cls = cls._meta.concrete_model
+        meta = cls._meta
+        if not meta.auto_created:
+            pre_save.send(
+                sender=origin, instance=self, raw=raw, using=using,
+                update_fields=update_fields,
+            )
+        with transaction.atomic(using=using, savepoint=False):
+            if not raw:
+                self._save_parents(cls, using, update_fields)
+            updated = self._save_table(raw, cls, force_insert, force_update, using, update_fields)
+        # Store the database on which the object was saved
+        self._state.db = using
+        # Once saved, this is no longer a to-be-added instance.
+        self._state.adding = False
+
+        # Signal that the save is complete
+        if not meta.auto_created:
+            post_save.send(
+                sender=origin, instance=self, created=(not updated),
+                update_fields=update_fields, raw=raw, using=using,
+            )
+
+发送信息
+if not meta.auto_created:
+    pre_save.send(
+        sender=origin, instance=self, raw=raw, using=using,
+        update_fields=update_fields,
+    )
+
+django\dispath\dispatcher.py
+class Signal:
+    def send(self, sender, **named):
+        """
+        Send signal from sender to all connected receivers.
+
+        If any receiver raises an error, the error propagates back through send,
+        terminating the dispatch loop. So it's possible that all receivers
+        won't be called if an error is raised.
+
+        Arguments:
+
+            sender
+                The sender of the signal. Either a specific object or None.
+
+            named
+                Named arguments which will be passed to receivers.
+
+        Return a list of tuple pairs [(receiver, response), ... ].
+        """
+        if not self.receivers or self.sender_receivers_cache.get(sender) is NO_RECEIVERS:
+            return []
+
+        return [
+            (receiver, receiver(signal=self, sender=sender, **named))
+            for receiver in self._live_receivers(sender)
+        ]
+ 
+ --------
+ with transaction.atomic(using=using, savepoint=False):
+    if not raw:
+        self._save_parents(cls, using, update_fields)
+    updated = self._save_table(raw, cls, force_insert, force_update, using, update_fields)
+ 
+
+def _save_parents(self, cls, using, update_fields):
+    """Save all the parents of cls using values from self."""
+    meta = cls._meta
+    for parent, field in meta.parents.items():
+        # Make sure the link fields are synced between parent and self.
+        if (field and getattr(self, parent._meta.pk.attname) is None and
+                getattr(self, field.attname) is not None):
+            setattr(self, parent._meta.pk.attname, getattr(self, field.attname))
+        self._save_parents(cls=parent, using=using, update_fields=update_fields)
+        self._save_table(cls=parent, using=using, update_fields=update_fields)
+        # Set the parent's PK value to self.
+        if field:
+            setattr(self, field.attname, self._get_pk_val(parent._meta))
+            # Since we didn't have an instance of the parent handy set
+            # attname directly, bypassing the descriptor. Invalidate
+            # the related object cache, in case it's been accidentally
+            # populated. A fresh instance will be re-built from the
+            # database if necessary.
+            if field.is_cached(self):
+                field.delete_cached_value(self)
+ 
+
+  if pk_set and not force_insert:
+      base_qs = cls._base_manager.using(using)
+      values = [(f, None, (getattr(self, f.attname) if raw else f.pre_save(self, False)))
+                for f in non_pks]
+      forced_update = update_fields or force_update
+      updated = self._do_update(base_qs, using, pk_val, values, update_fields,
+                                forced_update)
+      if force_update and not updated:
+          raise DatabaseError("Forced update did not affect any rows.")
+      if update_fields and not updated:
+          raise DatabaseError("Save with update_fields did not affect any rows.")
+          
+def _do_update(self, base_qs, using, pk_val, values, update_fields, forced_update):
+  """
+  Try to update the model. Return True if the model was updated (if an
+  update query was done and a matching row was found in the DB).
+  """
+  filtered = base_qs.filter(pk=pk_val)
+  if not values:
+      # We can end up here when saving a model in inheritance chain where
+      # update_fields doesn't target any field in current model. In that
+      # case we just say the update succeeded. Another case ending up here
+      # is a model with just PK - in that case check that the PK still
+      # exists.
+      return update_fields is not None or filtered.exists()
+  if self._meta.select_on_save and not forced_update:
+      return (
+          filtered.exists() and
+          # It may happen that the object is deleted from the DB right after
+          # this check, causing the subsequent UPDATE to return zero matching
+          # rows. The same result can occur in some rare cases when the
+          # database returns zero despite the UPDATE being executed
+          # successfully (a row is matched and updated). In order to
+          # distinguish these two cases, the object's existence in the
+          # database is again checked for if the UPDATE query returns 0.
+          (filtered._update(values) > 0 or filtered.exists())
+      )
+  return filtered._update(values) > 0
+ 
+filtered._update(values)
+def _update(self, values):
+  """
+  A version of update() that accepts field objects instead of field names.
+  Used primarily for model saving and not intended for use by general
+  code (it requires too much poking around at model internals to be
+  useful at that level).
+  """
+  assert self.query.can_filter(), \
+      "Cannot update a query once a slice has been taken."
+  query = self.query.chain(sql.UpdateQuery)
+  query.add_update_fields(values)
+  # Clear any annotations so that they won't be present in subqueries.
+  query._annotations = None
+  self._result_cache = None
+  return query.get_compiler(self.db).execute_sql(CURSOR)
+_update.alters_data = True
+_update.queryset_only = False
+
+query = self.query.chain(sql.UpdateQuery)
+<class 'django.db.models.sql.subqueries.UpdateQuery'>
+obj._setup_query()
+
+class UpdateQuery(Query):
+    """An UPDATE SQL query."""
+
+    compiler = 'SQLUpdateCompiler'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._setup_query()
+
+    def _setup_query(self):
+        """
+        Run on initialization and at the end of chaining. Any attributes that
+        would normally be set in __init__() should go here instead.
+        """
+        self.values = []
+        self.related_ids = None
+        self.related_updates = {}
+UpdateQuery 继承Query方法
+query.add_update_fields(values)?
+
+return query.get_compiler(self.db).execute_sql(CURSOR)
+
+def get_compiler(self, using=None, connection=None):
+    if using is None and connection is None:
+        raise ValueError("Need either using or connection")
+    if using:
+        connection = connections[using]
+    return connection.ops.compiler(self.compiler)(self, connection, using)
+
+connection <django.db.backends.mysql.base.DatabaseWrapper object at 0x7f8d38ec2c88>
+
+connection.ops.compiler(self.compiler)
+class SQLCompiler:
+    def __init__(self, query, connection, using):
+        self.query = query
+        self.connection = connection
+        self.using = using
+        self.quote_cache = {'*': '*'}
+        # The select, klass_info, and annotations are needed by QuerySet.iterator()
+        # these are set as a side-effect of executing the query. Note that we calculate
+        # separately a list of extra select columns needed for grammatical correctness
+        # of the query, but these columns are not included in self.select.
+        self.select = None
+        self.annotation_col_map = None
+        self.klass_info = None
+  
+class SQLUpdateCompiler(SQLCompiler):
+  def as_sql(self):
+      """
+      Create the SQL for this query. Return the SQL string and list of
+      parameters.
+      """
+      self.pre_sql_setup()
+      if not self.query.values:
+          return '', ()
+      qn = self.quote_name_unless_alias
+      values, update_params = [], []
+      for field, model, val in self.query.values:
+          if hasattr(val, 'resolve_expression'):
+              val = val.resolve_expression(self.query, allow_joins=False, for_save=True)
+              if val.contains_aggregate:
+                  raise FieldError("Aggregate functions are not allowed in this query")
+              if val.contains_over_clause:
+                  raise FieldError('Window expressions are not allowed in this query.')
+          elif hasattr(val, 'prepare_database_save'):
+              if field.remote_field:
+                  val = field.get_db_prep_save(
+                      val.prepare_database_save(field),
+                      connection=self.connection,
+                  )
+              else:
+                  raise TypeError(
+                      "Tried to update field %s with a model instance, %r. "
+                      "Use a value compatible with %s."
+                      % (field, val, field.__class__.__name__)
+                  )
+          else:
+              val = field.get_db_prep_save(val, connection=self.connection)
+
+          # Getting the placeholder for the field.
+          if hasattr(field, 'get_placeholder'):
+              placeholder = field.get_placeholder(val, self, self.connection)
+          else:
+              placeholder = '%s'
+          name = field.column
+          if hasattr(val, 'as_sql'):
+              sql, params = self.compile(val)
+              values.append('%s = %s' % (qn(name), placeholder % sql))
+              update_params.extend(params)
+          elif val is not None:
+              values.append('%s = %s' % (qn(name), placeholder))
+              update_params.append(val)
+          else:
+              values.append('%s = NULL' % qn(name))
+      table = self.query.base_table
+      result = [
+          'UPDATE %s SET' % qn(table),
+          ', '.join(values),
+      ]
+      where, params = self.compile(self.query.where)
+      if where:
+          result.append('WHERE %s' % where)
+      return ' '.join(result), tuple(update_params + params)
+
+  def execute_sql(self, result_type):
+      """
+      Execute the specified update. Return the number of rows affected by
+      the primary update query. The "primary update query" is the first
+      non-empty query that is executed. Row counts for any subsequent,
+      related queries are not available.
+      """
+      cursor = super().execute_sql(result_type)
+      try:
+          rows = cursor.rowcount if cursor else 0
+          is_empty = cursor is None
+      finally:
+          if cursor:
+              cursor.close()
+      for query in self.query.get_related_updates():
+          aux_rows = query.get_compiler(self.using).execute_sql(result_type)
+          if is_empty and aux_rows:
+              rows = aux_rows
+              is_empty = False
+      return rows
+      self.ordering_parts = re.compile(r'(.*)\s(ASC|DESC)(.*)')
+ 
+ cursor = super().execute_sql(result_type)
+ 
+ class SQLCompiler:
+     def execute_sql(self, result_type=MULTI, chunked_fetch=False, chunk_size=GET_ITERATOR_CHUNK_SIZE):
+        """
+        Run the query against the database and return the result(s). The
+        return value is a single data item if result_type is SINGLE, or an
+        iterator over the results if the result_type is MULTI.
+
+        result_type is either MULTI (use fetchmany() to retrieve all rows),
+        SINGLE (only retrieve a single row), or None. In this last case, the
+        cursor is returned if any query is executed, since it's used by
+        subclasses such as InsertQuery). It's possible, however, that no query
+        is needed, as the filters describe an empty set. In that case, None is
+        returned, to avoid any unnecessary database interaction.
+        """
+        result_type = result_type or NO_RESULTS
+        try:
+            sql, params = self.as_sql()
+            if not sql:
+                raise EmptyResultSet
+        except EmptyResultSet:
+            if result_type == MULTI:
+                return iter([])
+            else:
+                return
+        if chunked_fetch:
+            cursor = self.connection.chunked_cursor()
+        else:
+            cursor = self.connection.cursor()
+        try:
+            cursor.execute(sql, params)
+        except Exception:
+            # Might fail for server-side cursors (e.g. connection closed)
+            cursor.close()
+            raise
+
+        if result_type == CURSOR:
+            # Give the caller the cursor to process and close.
+            return cursor
+        if result_type == SINGLE:
+            try:
+                val = cursor.fetchone()
+                if val:
+                    return val[0:self.col_count]
+                return val
+            finally:
+                # done with the cursor
+                cursor.close()
+        if result_type == NO_RESULTS:
+            cursor.close()
+            return
+
+        result = cursor_iter(
+            cursor, self.connection.features.empty_fetchmany_value,
+            self.col_count if self.has_extra_select else None,
+            chunk_size,
+        )
+        if not chunked_fetch and not self.connection.features.can_use_chunked_reads:
+            try:
+                # If we are using non-chunked reads, we return the same data
+                # structure as normally, but ensure it is all read into memory
+                # before going any further. Use chunked_fetch if requested.
+                return list(result)
+            finally:
+                # done with the cursor
+                cursor.close()
+        return result
+ 
+ class SQLUpdateCompiler(SQLCompiler):
+    def as_sql(self):
+        """
+        Create the SQL for this query. Return the SQL string and list of
+        parameters.
+        """
+        self.pre_sql_setup()
+        if not self.query.values:
+            return '', ()
+        qn = self.quote_name_unless_alias
+        values, update_params = [], []
+        for field, model, val in self.query.values:
+            if hasattr(val, 'resolve_expression'):
+                val = val.resolve_expression(self.query, allow_joins=False, for_save=True)
+                if val.contains_aggregate:
+                    raise FieldError("Aggregate functions are not allowed in this query")
+                if val.contains_over_clause:
+                    raise FieldError('Window expressions are not allowed in this query.')
+            elif hasattr(val, 'prepare_database_save'):
+                if field.remote_field:
+                    val = field.get_db_prep_save(
+                        val.prepare_database_save(field),
+                        connection=self.connection,
+                    )
+                else:
+                    raise TypeError(
+                        "Tried to update field %s with a model instance, %r. "
+                        "Use a value compatible with %s."
+                        % (field, val, field.__class__.__name__)
+                    )
+            else:
+                val = field.get_db_prep_save(val, connection=self.connection)
+
+            # Getting the placeholder for the field.
+            if hasattr(field, 'get_placeholder'):
+                placeholder = field.get_placeholder(val, self, self.connection)
+            else:
+                placeholder = '%s'
+            name = field.column
+            if hasattr(val, 'as_sql'):
+                sql, params = self.compile(val)
+                values.append('%s = %s' % (qn(name), placeholder % sql))
+                update_params.extend(params)
+            elif val is not None:
+                values.append('%s = %s' % (qn(name), placeholder))
+                update_params.append(val)
+            else:
+                values.append('%s = NULL' % qn(name))
+        table = self.query.base_table
+        result = [
+            'UPDATE %s SET' % qn(table),
+            ', '.join(values),
+        ]
+        where, params = self.compile(self.query.where)
+        if where:
+            result.append('WHERE %s' % where)
+        return ' '.join(result), tuple(update_params + params)
+  
+  拼装成一个更新的sql语句      
+  <class 'list'>: ['UPDATE `drest_snippet` SET', '`created` = %s, `title` = %s, `code` = %s, `linenos` = %s, `language` = %s, `style` = %s, `owner_id` = %s, `highlighted` = %s']
+  然后把where条件加入其中
+  parms:<class 'tuple'>: ('2019-05-06 09:42:51.015865', '艾瑞克', 'python', True, 'antlr-python', 'lovelace', 1, '<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN"\n   "http://www.w3.org/TR/html4/strict.dtd">\n\n<html>\n<head>\n  <title>艾瑞克</title>\n  <meta http-equiv="content-type" content="text/html; charset=None">\n  <style type="text/css">\ntd.linenos { background-color: #f0f0f0; padding-right: 10px; }\nspan.lineno { background-color: #f0f0f0; padding: 0 5px 0 5px; }\npre { line-height: 125%; }\nbody .hll { background-color: #ffffcc }\nbody  { background: #ffffff; }\nbody .c { color: #888888; font-style: italic } /* Comment */\nbody .err { background-color: #a848a8 } /* Error */\nbody .k { color: #2838b0 } /* Keyword */\nbody .o { color: #666666 } /* Operator */\nbody .p { color: #888888 } /* Punctuation */\nbody .ch { color: #287088; font-style: italic } /* Comment.Hashbang */\nbody .cm { color: #888888; font-style: italic } /* Comment.Multiline */\nbody .cp { color: #289870 } /* Comment.Preproc */\nbody .cpf { color: #888888; font-style: italic } /* Comment.PreprocFile */\nbody .c1 { color: #888888; font-style: italic } /* Comment.Single */\nbody .cs { color: #888888; font-style: italic } /* Comment.Special */\nbody .gd { color: #c02828 } /* Generic.Deleted */\nbody .ge { font-style: italic } /* Generic.Emph */\nbody .gr { color: #c02828 } /* Generic.Error */\nbody .gh { color: #666666 } /* Generic.Heading */\nbody .gi { color: #388038 } /* Generic.Inserted */\nbody .go { color: #666666 } /* Generic.Output */\nbody .gp { color: #444444 } /* Generic.Prompt */\nbody .gs { font-weight: bold } /* Generic.Strong */\nbody .gu { color: #444444 } /* Generic.Subheading */\nbody .gt { color: #2838b0 } /* Generic.Traceback */\nbody .kc { color: #444444; font-style: italic } /* Keyword.Constant */\nbody .kd { color: #2838b0; font-style: italic } /* Keyword.Declaration */\nbody .kn { color: #2838b0 } /* Keyword.Namespace */\nbody .kp { color: #2838b0 } /* Keyword.Pseudo */\nbody .kr { color: #2838b0 } /* Keyword.Reserved */\nbody .kt { color: #2838b0; font-style: italic } /* Keyword.Type */\nbody .m { color: #444444 } /* Literal.Number */\nbody .s { color: #b83838 } /* Literal.String */\nbody .na { color: #388038 } /* Name.Attribute */\nbody .nb { color: #388038 } /* Name.Builtin */\nbody .nc { color: #287088 } /* Name.Class */\nbody .no { color: #b85820 } /* Name.Constant */\nbody .nd { color: #287088 } /* Name.Decorator */\nbody .ni { color: #709030 } /* Name.Entity */\nbody .ne { color: #908828 } /* Name.Exception */\nbody .nf { color: #785840 } /* Name.Function */\nbody .nl { color: #289870 } /* Name.Label */\nbody .nn { color: #289870 } /* Name.Namespace */\nbody .nt { color: #2838b0 } /* Name.Tag */\nbody .nv { color: #b04040 } /* Name.Variable */\nbody .ow { color: #a848a8 } /* Operator.Word */\nbody .w { color: #a89028 } /* Text.Whitespace */\nbody .mb { color: #444444 } /* Literal.Number.Bin */\nbody .mf { color: #444444 } /* Literal.Number.Float */\nbody .mh { color: #444444 } /* Literal.Number.Hex */\nbody .mi { color: #444444 } /* Literal.Number.Integer */\nbody .mo { color: #444444 } /* Literal.Number.Oct */\nbody .sa { color: #444444 } /* Literal.String.Affix */\nbody .sb { color: #b83838 } /* Literal.String.Backtick */\nbody .sc { color: #a848a8 } /* Literal.String.Char */\nbody .dl { color: #b85820 } /* Literal.String.Delimiter */\nbody .sd { color: #b85820; font-style: italic } /* Literal.String.Doc */\nbody .s2 { color: #b83838 } /* Literal.String.Double */\nbody .se { color: #709030 } /* Literal.String.Escape */\nbody .sh { color: #b83838 } /* Literal.String.Heredoc */\nbody .si { color: #b83838; text-decoration: underline } /* Literal.String.Interpol */\nbody .sx { color: #a848a8 } /* Literal.String.Other */\nbody .sr { color: #a848a8 } /* Literal.String.Regex */\nbody .s1 { color: #b83838 } /* Literal.String.Single */\nbody .ss { color: #b83838 } /* Literal.String.Symbol */\nbody .bp { color: #388038; font-style: italic } /* Name.Builtin.Pseudo */\nbody .fm { color: #b85820 } /* Name.Function.Magic */\nbody .vc { color: #b04040 } /* Name.Variable.Class */\nbody .vg { color: #908828 } /* Name.Variable.Global */\nbody .vi { color: #b04040 } /* Name.Variable.Instance */\nbody .vm { color: #b85820 } /* Name.Variable.Magic */\nbody .il { color: #444444 } /* Literal.Number.Integer.Long */\n\n  </style>\n</head>\n<body>\n<h2>艾瑞克</h2>\n\n<table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre>1</pre></div></td><td class="code"><div class="highlight"><pre><span></span><span class="nl">python</span><span class="w"></span>\n</pre></div>\n</td></tr></table></body>\n</html>\n', 7)
+  sql, params = self.as_sql()
+  
+  把sql语句拼装成一个原则的sql语句(key,value的方式)
