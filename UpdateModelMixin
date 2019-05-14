@@ -601,3 +601,224 @@ class SQLUpdateCompiler(SQLCompiler):
   sql, params = self.as_sql()
   
   把sql语句拼装成一个原则的sql语句(key,value的方式)
+
+if chunked_fetch:
+    cursor = self.connection.chunked_cursor()
+else:
+    cursor = self.connection.cursor()
+django\db\backends\base\base.py
+class BaseDatabaseWrapper:
+       ......
+初始化cursor
+
+try:
+    cursor.execute(sql, params)
+except Exception:
+    # Might fail for server-side cursors (e.g. connection closed)
+    cursor.close()
+django\db\backends\utils.py
+class CursorDebugWrapper(CursorWrapper):
+
+    # XXX callproc isn't instrumented at this time.
+
+    def execute(self, sql, params=None):
+        start = time()
+        try:
+            return super().execute(sql, params)
+        finally:
+            stop = time()
+            duration = stop - start
+            sql = self.db.ops.last_executed_query(self.cursor, sql, params)
+            self.db.queries_log.append({
+                'sql': sql,
+                'time': "%.3f" % duration,
+            })
+            logger.debug(
+                '(%.3f) %s; args=%s', duration, sql, params,
+                extra={'duration': duration, 'sql': sql, 'params': params}
+            )
+    raise
+ 
+ return super().execute(sql, params)
+ 
+ django\db\backends\utils.py
+ class CursorWrapper:
+     def execute(self, sql, params=None):
+        return self._execute_with_wrappers(sql, params, many=False, executor=self._execute)
+ 
+def _execute_with_wrappers(self, sql, params, many, executor):
+    context = {'connection': self.db, 'cursor': self}
+    for wrapper in reversed(self.db.execute_wrappers):
+        executor = functools.partial(wrapper, executor)
+    return executor(sql, params, many, context)
+
+def _execute(self, sql, params, *ignored_wrapper_args):
+    self.db.validate_no_broken_transaction()
+    with self.db.wrap_database_errors:
+        if params is None:
+            return self.cursor.execute(sql)
+        else:
+            return self.cursor.execute(sql, params)
+
+django\db\backends\mysql\base.py
+class CursorWrapper:
+    """
+    A thin wrapper around MySQLdb's normal cursor class that catches particular
+    exception instances and reraises them with the correct types.
+
+    Implemented as a wrapper, rather than a subclass, so that it isn't stuck
+    to the particular underlying representation returned by Connection.cursor().
+    """
+    codes_for_integrityerror = (
+        1048,  # Column cannot be null
+        1690,  # BIGINT UNSIGNED value is out of range
+    )
+
+    def __init__(self, cursor):
+        self.cursor = cursor
+
+    def execute(self, query, args=None):
+        try:
+            # args is None means no string interpolation
+            return self.cursor.execute(query, args)
+        except Database.OperationalError as e:
+            # Map some error codes to IntegrityError, since they seem to be
+            # misclassified and Django would prefer the more logical place.
+            if e.args[0] in self.codes_for_integrityerror:
+                raise utils.IntegrityError(*tuple(e.args))
+            raise
+ 
+return self.cursor.execute(query, args)
+MySQLdb\cursors.py
+class BaseCursor(object):
+    """A base for Cursor classes. Useful attributes:
+
+    description
+        A tuple of DB API 7-tuples describing the columns in
+        the last executed query; see PEP-249 for details.
+
+    description_flags
+        Tuple of column flags for last query, one entry per column
+        in the result set. Values correspond to those in
+        MySQLdb.constants.FLAG. See MySQL documentation (C API)
+        for more information. Non-standard extension.
+
+    arraysize
+        default number of rows fetchmany() will fetch
+    """
+
+    #: Max stetement size which :meth:`executemany` generates.
+    #:
+    #: Max size of allowed statement is max_allowed_packet - packet_header_size.
+    #: Default value of max_allowed_packet is 1048576.
+    max_stmt_length = 64*1024
+
+    from _mysql_exceptions import MySQLError, Warning, Error, InterfaceError, \
+         DatabaseError, DataError, OperationalError, IntegrityError, \
+         InternalError, ProgrammingError, NotSupportedError
+
+    _defer_warnings = False
+    connection = None
+    .......
+    def execute(self, query, args=None):
+        """Execute a query.
+
+        query -- string, query to execute on server
+        args -- optional sequence or mapping, parameters to use with query.
+
+        Note: If args is a sequence, then %s must be used as the
+        parameter placeholder in the query. If a mapping is used,
+        %(key)s must be used as the placeholder.
+
+db = self._get_db()
+<_mysql.connection open to '1.1.1.1' at 7f8d14162898>
+
+try:
+    query = query % args
+except TypeError as m:
+    self.errorhandler(self, ProgrammingError, str(m))
+        Returns integer represents rows affected, if any
+        """
+        while self.nextset():
+            pass
+        db = self._get_db()
+
+        # NOTE:
+        # Python 2: query should be bytes when executing %.
+        # All unicode in args should be encoded to bytes on Python 2.
+        # Python 3: query should be str (unicode) when executing %.
+        # All bytes in args should be decoded with ascii and surrogateescape on Python 3.
+        # db.literal(obj) always returns str.
+
+        if PY2 and isinstance(query, unicode):
+            query = query.encode(db.encoding)
+
+        if args is not None:
+            if isinstance(args, dict):
+                args = dict((key, db.literal(item)) for key, item in args.items())
+            else:
+                args = tuple(map(db.literal, args))
+            if not PY2 and isinstance(query, (bytes, bytearray)):
+                query = query.decode(db.encoding)
+            try:
+                query = query % args
+            except TypeError as m:
+                self.errorhandler(self, ProgrammingError, str(m))
+
+        if isinstance(query, unicode):
+            query = query.encode(db.encoding, 'surrogateescape')
+
+        res = None
+        try:
+            res = self._query(query)
+        except Exception:
+            exc, value = sys.exc_info()[:2]
+            self.errorhandler(self, exc, value)
+        if not self._defer_warnings:
+            self._warning_check()
+        return res
+
+try:
+    query = query % args
+except TypeError as m:
+    self.errorhandler(self, ProgrammingError, str(m))
+对sql语句进行封装,封装成mysql能封装的sql语句,对其进行转码encode操作
+b'UPDATE `drest_snippet` SET `created` = \'2019-05-06 09:42:51.015865\', `title` = \'\xe8\x89\xbe\xe7\x91\x9e\xe5\x85\x8b\', `code` = \'python\', `linenos` = 1, `language` = \'antlr-python\', `style` = \'lovelace\', `owner_id` = 1, `highlighted` = \'<!DOCTYPE html PUBLIC \\"-//W3C//DTD HTML 4.01//EN\\"\\n   \\"http://www.w3.org/TR/html4/strict.dtd\\">\\n\\n<html>\\n<head>\\n  <title>\xe8\x89\xbe\xe7\x91\x9e\xe5\x85\x8b</title>\\n  <meta http-equiv=\\"content-type\\" content=\\"text/html; charset=None\\">\\n  <style type=\\"text/css\\">\\ntd.linenos { background-color: #f0f0f0; padding-right: 10px; }\\nspan.lineno { background-color: #f0f0f0; padding: 0 5px 0 5px; }\\npre { line-height: 125%; }\\nbody .hll { background-color: #ffffcc }\\nbody  { background: #ffffff; }\\nbody .c { color: #888888; font-style: italic } /* Comment */\\nbody .err { background-color: #a848a8 } /* Error */\\nbody .k { color: #2838b0 } /* Keyword */\\nbody .o { color: #666666 } /* Operator */\\nbody .p { color: #888888 } /* Punctuation */\\nbody .ch { color: #287088; font-style: italic } /* Comment.Hashbang */\\nbody .cm { color: #888888; font-style: italic } /* Comment.Multiline */\\nbody .cp { color: #289870 } /* Comment.Preproc */\\nbody .cpf { color: #888888; font-style: italic } /* Comment.PreprocFile */\\nbody .c1 { color: #888888; font-style: italic } /* Comment.Single */\\nbody .cs { color: #888888; font-style: italic } /* Comment.Special */\\nbody .gd { color: #c02828 } /* Generic.Deleted */\\nbody .ge { font-style: italic } /* Generic.Emph */\\nbody .gr { color: #c02828 } /* Generic.Error */\\nbody .gh { color: #666666 } /* Generic.Heading */\\nbody .gi { color: #388038 } /* Generic.Inserted */\\nbody .go { color: #666666 } /* Generic.Output */\\nbody .gp { color: #444444 } /* Generic.Prompt */\\nbody .gs { font-weight: bold } /* Generic.Strong */\\nbody .gu { color: #444444 } /* Generic.Subheading */\\nbody .gt { color: #2838b0 } /* Generic.Traceback */\\nbody .kc { color: #444444; font-style: italic } /* Keyword.Constant */\\nbody .kd { color: #2838b0; font-style: italic } /* Keyword.Declaration */\\nbody .kn { color: #2838b0 } /* Keyword.Namespace */\\nbody .kp { color: #2838b0 } /* Keyword.Pseudo */\\nbody .kr { color: #2838b0 } /* Keyword.Reserved */\\nbody .kt { color: #2838b0; font-style: italic } /* Keyword.Type */\\nbody .m { color: #444444 } /* Literal.Number */\\nbody .s { color: #b83838 } /* Literal.String */\\nbody .na { color: #388038 } /* Name.Attribute */\\nbody .nb { color: #388038 } /* Name.Builtin */\\nbody .nc { color: #287088 } /* Name.Class */\\nbody .no { color: #b85820 } /* Name.Constant */\\nbody .nd { color: #287088 } /* Name.Decorator */\\nbody .ni { color: #709030 } /* Name.Entity */\\nbody .ne { color: #908828 } /* Name.Exception */\\nbody .nf { color: #785840 } /* Name.Function */\\nbody .nl { color: #289870 } /* Name.Label */\\nbody .nn { color: #289870 } /* Name.Namespace */\\nbody .nt { color: #2838b0 } /* Name.Tag */\\nbody .nv { color: #b04040 } /* Name.Variable */\\nbody .ow { color: #a848a8 } /* Operator.Word */\\nbody .w { color: #a89028 } /* Text.Whitespace */\\nbody .mb { color: #444444 } /* Literal.Number.Bin */\\nbody .mf { color: #444444 } /* Literal.Number.Float */\\nbody .mh { color: #444444 } /* Literal.Number.Hex */\\nbody .mi { color: #444444 } /* Literal.Number.Integer */\\nbody .mo { color: #444444 } /* Literal.Number.Oct */\\nbody .sa { color: #444444 } /* Literal.String.Affix */\\nbody .sb { color: #b83838 } /* Literal.String.Backtick */\\nbody .sc { color: #a848a8 } /* Literal.String.Char */\\nbody .dl { color: #b85820 } /* Literal.String.Delimiter */\\nbody .sd { color: #b85820; font-style: italic } /* Literal.String.Doc */\\nbody .s2 { color: #b83838 } /* Literal.String.Double */\\nbody .se { color: #709030 } /* Literal.String.Escape */\\nbody .sh { color: #b83838 } /* Literal.String.Heredoc */\\nbody .si { color: #b83838; text-decoration: underline } /* Literal.String.Interpol */\\nbody .sx { color: #a848a8 } /* Literal.String.Other */\\nbody .sr { color: #a848a8 } /* Literal.String.Regex */\\nbody .s1 { color: #b83838 } /* Literal.String.Single */\\nbody .ss { color: #b83838 } /* Literal.String.Symbol */\\nbody .bp { color: #388038; font-style: italic } /* Name.Builtin.Pseudo */\\nbody .fm { color: #b85820 } /* Name.Function.Magic */\\nbody .vc { color: #b04040 } /* Name.Variable.Class */\\nbody .vg { color: #908828 } /* Name.Variable.Global */\\nbody .vi { color: #b04040 } /* Name.Variable.Instance */\\nbody .vm { color: #b85820 } /* Name.Variable.Magic */\\nbody .il { color: #444444 } /* Literal.Number.Integer.Long */\\n\\n  </style>\\n</head>\\n<body>\\n<h2>\xe8\x89\xbe\xe7\x91\x9e\xe5\x85\x8b</h2>\\n\\n<table class=\\"highlighttable\\"><tr><td class=\\"linenos\\"><div class=\\"linenodiv\\"><pre>1</pre></div></td><td class=\\"code\\"><div class=\\"highlight\\"><pre><span></span><span class=\\"nl\\">python</span><span class=\\"w\\"></span>\\n</pre></div>\\n</td></tr></table></body>\\n</html>\\n\' WHERE `drest_snippet`.`id` = 7'
+ 
+ res = self._query(query)
+def _query(self, q):
+    db = self._get_db()
+    self._result = None
+    db.query(q)
+    self._do_get_result(db)
+    self._post_get_result()
+    self._executed = q
+    return self.rowcount
+
+db.query(q)
+MySQLdb\connections.py
+class Connection(_mysql.connection):
+    """MySQL Database Connection Object"""
+
+    default_cursor = cursors.Cursor
+    waiter = None
+    
+    def query(self, query):
+        # Since _mysql releases GIL while querying, we need immutable buffer.
+        if isinstance(query, bytearray):
+            query = bytes(query)
+        if self.waiter is not None:
+            self.send_query(query)
+            self.waiter(self.fileno())
+            self.read_query_result()
+        else:
+            _mysql.connection.query(self, query)
+ 
+ _mysql.connection.query(self, query)
+ 执行一个具体的sql操作,这里是update操作.
+ db <_mysql.connection open to '192.168.7.115' at 7f42a0010cc8>
+ b'UPDATE `drest_snippet` SET `created` = \'2019-05-06 09:42:51.015865\', `title` = \'\xe8\x89\xbe\xe7\x91\x9e\', `code` = \'python\', `linenos` = 1, `language` = \'ada\', `style` = \'tango\', `owner_id` = 1 WHERE `drest_snippet`.`id` = 7'
+ 
+self._do_get_result(db)
+获取update 返回的条数
+暂时分析到这
