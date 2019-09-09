@@ -1,0 +1,49 @@
+动态导入特定文件夹下面的py文件
+
+class LoadPluginsClass(object):
+    """"
+        Import module information in Linux plugins folder dynamically
+    """
+
+    def __init__(self):
+        self.package = 'plugins'
+
+    def _get_classes_from_module(self, module_name):
+        """Get the classes from a module that match the type we want."""
+        classes = []
+      
+        module = importlib.import_module(module_name)
+        for obj_name in dir(module):
+            if obj_name.startswith('_'):
+                continue
+            itm = getattr(module, obj_name)
+            if self._is_correct_class(itm):
+                classes.append(itm)
+        return classes
+
+    def _is_correct_class(self, obj):
+        return (inspect.isclass(obj) and
+                (not obj.__name__.startswith('_')))
+
+    def get_all_classes(self):
+        classes = []
+        plugins_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                                   self.package)
+
+        for dirpath, dirnames, filenames in os.walk(plugins_dir):
+            relpath = os.path.relpath(dirpath, plugins_dir)
+            if relpath == '.':
+                relpkg = ''
+            else:
+                relpkg = '.%s' % '.'.join(relpath.split(os.sep))
+            for fname in filenames:
+                root, ext = os.path.splitext(fname)
+                if ext != '.py' or root == '__init__':
+                    continue
+
+                module_name = "%s%s.%s" % (self.package, relpkg, root)
+                mod_classes = self._get_classes_from_module(module_name)
+                classes.extend(mod_classes)
+        return classes
+
+核心点就是importlib.import_module(module_name)这行代码,module_name 需要类似xxx.xxx的结构,不需要绝对路径
